@@ -443,6 +443,48 @@ void __stdcall raven_raise_exception(DWORD code, DWORD flags, DWORD count, const
 	dispatch(&record, &context);
 }
 
+/* Execution goes on where the handler's context says: its stack, its frame, its general registers and the instruction it left to run
+ * next. A handler that skips a faulting instruction moves Eip past it here, as the system applies the context it hands back. POPA takes
+ * the eight words at esp-36, skips the stack pointer among them, and leaves esp at esp-4, where the return address waits. */
+__asm__(".text\n"
+	"_raven_continue_context:\n\t"
+	"movl 4(%esp), %ecx\n\t"
+	"pushl 0xc0(%ecx)\n\t"
+	"popfl\n\t"
+	"movl 0xc4(%ecx), %edx\n\t"
+	"movl 0xb8(%ecx), %eax\n\t"
+	"movl %eax, -4(%edx)\n\t"
+	"movl 0x9c(%ecx), %eax\n\t"
+	"movl %eax, -36(%edx)\n\t"
+	"movl 0xa0(%ecx), %eax\n\t"
+	"movl %eax, -32(%edx)\n\t"
+	"movl 0xb4(%ecx), %eax\n\t"
+	"movl %eax, -28(%edx)\n\t"
+	"movl $0, -24(%edx)\n\t"
+	"movl 0xa4(%ecx), %eax\n\t"
+	"movl %eax, -20(%edx)\n\t"
+	"movl 0xa8(%ecx), %eax\n\t"
+	"movl %eax, -16(%edx)\n\t"
+	"movl 0xac(%ecx), %eax\n\t"
+	"movl %eax, -12(%edx)\n\t"
+	"movl 0xb0(%ecx), %eax\n\t"
+	"movl %eax, -8(%edx)\n\t"
+	"leal -36(%edx), %esp\n\t"
+	"popal\n\t"
+	"ret\n");
+void raven_continue_context(CONTEXT *context) __attribute__((noreturn));
+
+/* A fault the runtime caught, with the program's own record and context, so a handler that continues resumes where it says. The record
+ * is built here because the code is the runtime's, not the program's. */
+CRT void __stdcall raven_raise_fault(DWORD code, DWORD address, CONTEXT *context)
+{
+	EXCEPTION_RECORD record = {0};
+	record.ExceptionCode = code;
+	record.ExceptionAddress = (PVOID)address;
+	dispatch(&record, context);
+	raven_continue_context(context);
+}
+
 /* RtlUnwind for 32-bit programs: the frames above the target hear that they are being unwound and leave the chain. The compiled code
  * that calls it continues right after the call, which is where it returns. */
 void __stdcall raven_unwind(cxx_registration *target, void *target_ip, EXCEPTION_RECORD *record, void *value)

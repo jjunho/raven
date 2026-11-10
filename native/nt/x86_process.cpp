@@ -33,6 +33,7 @@
 #include "x86_thread_api.h"
 
 #include <unistd.h>
+#include <sys/mman.h>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -53,6 +54,31 @@ namespace {
 constexpr ComMethod malloc_methods[] = {{"IMalloc", "QueryInterface", 0, 3}, {"IMalloc", "AddRef", 1, 1}, {"IMalloc", "Release", 2, 1},
 	{"IMalloc", "Alloc", 3, 2}, {"IMalloc", "Realloc", 4, 3}, {"IMalloc", "Free", 5, 2}, {"IMalloc", "GetSize", 6, 2}, {"IMalloc", "DidAlloc", 7, 2},
 	{"IMalloc", "HeapMinimize", 8, 1}};
+
+// The instructions a user-mode program may not run. A virtual machine or debugger check runs one and reads the fault, so the fault is
+// the system's exception rather than the end of the process.
+constexpr uint32_t exception_privileged_instruction = 0xc0000096;
+
+bool privileged_instruction(std::span<const uint8_t> bytes)
+{
+	if (bytes.empty())
+		return false;
+	switch (bytes[0]) {
+	case 0xe4: case 0xe5: case 0xe6: case 0xe7: // in/out al|eax, imm8
+	case 0xec: case 0xed: case 0xee: case 0xef: // in/out al|eax, dx
+	case 0xf4: // hlt
+	case 0xfa: case 0xfb: // cli, sti
+		return true;
+	default:
+		break;
+	}
+	if (bytes.size() < 2 || bytes[0] != 0x0f)
+		return false;
+	const uint8_t opcode = bytes[1];
+	// invd, wbinvd, the control and debug register moves, wrmsr and rdmsr. The table instructions of 0f 01 are left out: xgetbv is one
+	// of them and programs query it on every start.
+	return opcode == 0x08 || opcode == 0x09 || opcode == 0x30 || opcode == 0x32 || (opcode >= 0x20 && opcode <= 0x23);
+}
 
 // stdcall argument counts for every API the x86 process runner can dispatch.
 constexpr std::array<std::pair<std::string_view, uint32_t>, 115> kernel32_exports{{
@@ -551,8 +577,7 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 		provider.runtime_api = true;
 		overlay(provider, dll);
 		for (const auto &symbol : provider.exports) {
-			if (!symbol.forwarder.empty())
-				continue;
+			// A forwarded export keeps its stub: a program that resolved the export table rather than an import calls it by address.
 			const auto &exported = symbol.names.at(0);
 			const auto view = std::find(exports.begin(), exports.end(), exported);
 			const auto found = desktop_arguments().find(exported);
@@ -622,8 +647,7 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 		provider.runtime_api = true;
 		overlay(provider, dll);
 		for (const auto &symbol : provider.exports) {
-			if (!symbol.forwarder.empty())
-				continue;
+			// A forwarded export keeps its stub: a program that resolved the export table rather than an import calls it by address.
 			// An export that has only an ordinal is the name the library lists for that ordinal.
 			std::string exported;
 			if (!symbol.names.empty()) {
@@ -948,6 +972,127 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 		return true;
 	};
 	const auto remaining = [&] { return std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()); };
+	// A hardware fault the system would turn into an exception reaches the program's own handlers: the virtual machine and debugger checks
+	// of protected modules run a privileged instruction or an int3 and read the fault, and a plain crash is a fault no handler takes.
+	// The component is entered through a frame that names the faulting instruction, so both the record and the context point at it. A
+	// handler that continues resumes where its context says; one that keeps returning to the same instruction ends the run after a few
+	// rounds instead of spinning.
+	uint64_t faulting_instruction = 0;
+	uint32_t fault_rounds = 0;
+	uint64_t fault_context = 0;
+	const auto raise_guest_fault = [&](NativeResult &result) {
+		if (result.stop != NativeStop::fault)
+			return false;
+		const auto component = modules.all().find("ucrtbase.dll");
+		if (component == modules.all().end() || component->second->runtime_api)
+			return false;
+		const auto &exports = component->second->exports;
+		const auto raised = std::find_if(exports.begin(), exports.end(), [](const auto &symbol) {
+			return symbol.forwarder.empty() &&
+				std::find(symbol.names.begin(), symbol.names.end(), "raven_raise_fault") != symbol.names.end();
+		});
+		if (raised == exports.end() || !raised->address)
+			return false;
+		auto context = process.context();
+		const uint64_t eip = context.registers.rip & 0xffffffffULL, esp = context.registers.rsp & 0xffffffffULL;
+		// The exception the system would raise, and the address the record names. INT3 leaves the instruction pointer after itself,
+		// where a handler that continues goes on running; every other fault leaves it on the instruction.
+		uint32_t exception = 0, fault_address = eip;
+		try {
+			const auto instruction = process.read_memory(eip, 2);
+			if (result.signal == 5 && eip && process.read_memory(eip - 1, 1).front() == 0xcc) {
+				exception = 0x80000003; // EXCEPTION_BREAKPOINT
+				fault_address = eip - 1;
+			} else if (result.signal == 4) {
+				exception = 0xc000001d; // EXCEPTION_ILLEGAL_INSTRUCTION
+			} else if (privileged_instruction(instruction)) {
+				exception = exception_privileged_instruction;
+			}
+		} catch (const std::runtime_error &) {
+			return false;
+		}
+		if (!exception || esp < 16)
+			return false;
+		fault_rounds = faulting_instruction == eip ? fault_rounds + 1 : 1;
+		faulting_instruction = eip;
+		if (fault_rounds > 8)
+			return false;
+		// The faulting registers, in the context the component's headers lay out: the flags, the segment selectors and the general
+		// registers a handler may read or change, with the instruction pointer on the instruction that faulted.
+		if (!fault_context)
+			fault_context = process.map_memory(4096, PROT_READ | PROT_WRITE);
+		std::vector<uint8_t> registers(0x2cc, 0), frame(16, 0);
+		const auto put = [](std::vector<uint8_t> &bytes, size_t at, uint64_t value) {
+			for (size_t byte = 0; byte < 4; ++byte)
+				bytes[at + byte] = uint8_t(value >> (byte * 8));
+		};
+		put(registers, 0x00, 0x10003); // CONTEXT_i386 | CONTEXT_CONTROL | CONTEXT_INTEGER
+		put(registers, 0x8c, context.registers.gs);
+		put(registers, 0x90, context.registers.fs);
+		put(registers, 0x94, context.registers.es);
+		put(registers, 0x98, context.registers.ds);
+		put(registers, 0x9c, context.registers.rdi);
+		put(registers, 0xa0, context.registers.rsi);
+		put(registers, 0xa4, context.registers.rbx);
+		put(registers, 0xa8, context.registers.rdx);
+		put(registers, 0xac, context.registers.rcx);
+		put(registers, 0xb0, context.registers.rax);
+		put(registers, 0xb4, context.registers.rbp);
+		put(registers, 0xb8, eip);
+		put(registers, 0xbc, context.registers.cs);
+		put(registers, 0xc0, context.registers.eflags);
+		put(registers, 0xc4, esp);
+		put(registers, 0xc8, context.registers.ss);
+		process.write_memory(fault_context, registers);
+		// The return address is the faulting instruction, so a component that ever returned would fault again rather than run astray.
+		put(frame, 0, eip);
+		put(frame, 4, exception);
+		put(frame, 8, fault_address);
+		put(frame, 12, fault_context);
+		process.write_memory(esp - 16, frame);
+		if (std::getenv("RAVEN_TRACE_X86")) {
+			std::cerr << std::hex << "raven: fault at 0x" << eip << " raised 0x" << exception << " in";
+			for (const auto &[module_name, module] : modules.all()) {
+				const uint64_t base = module->loaded.base();
+				if (eip < base || eip >= base + module->image.image_size)
+					continue;
+				std::cerr << ' ' << module_name << '+' << (eip - base);
+				const auto named = std::find_if(module->exports.begin(), module->exports.end(), [&](const auto &symbol) {
+					return !symbol.names.empty() && base + symbol.address == fault_address;
+				});
+				if (named != module->exports.end())
+					std::cerr << " (" << named->names.front() << ')';
+			}
+			std::cerr << std::dec << '\n';
+		}
+		context.registers.rip = component->second->loaded.base() + raised->address;
+		context.registers.rsp = esp - 16;
+		process.set_context(context);
+		result = process.resume(remaining());
+		return true;
+	};
+	// The function a provider stub forwards to: a program that reads a library's export table, as a protector does, calls a stub by
+	// address, where an import is bound to the forwarded function itself.
+	const auto forwarded_target = [&](uint64_t stub) -> std::optional<uint64_t> {
+		for (const auto &[name, module] : modules.all()) {
+			if (!module->runtime_api)
+				continue;
+			const uint64_t base = module->loaded.base();
+			if (stub < base || stub >= base + module->image.image_size)
+				continue;
+			const auto symbol = std::find_if(module->exports.begin(), module->exports.end(), [&](const auto &item) {
+				return !item.forwarder.empty() && !item.names.empty() && base + item.address == stub;
+			});
+			if (symbol == module->exports.end())
+				continue;
+			try {
+				return modules.resolve({name, symbol->names.front(), 0, false, 0});
+			} catch (const std::runtime_error &) {
+				return std::nullopt;
+			}
+		}
+		return std::nullopt;
+	};
 	// Runs one guest call, answering every API trap until the call returns or stops for another reason.
 	const auto invoke = [&](uint64_t address, std::span<const uint64_t> arguments) {
 		auto budget = remaining();
@@ -962,7 +1107,10 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 			return name.starts_with("Zw") &&
 				shared_api.dispatch(process, environment, std::string("Nt").append(name.substr(2)), true);
 		};
-		while (result.stop == NativeStop::api) {
+		while (result.stop == NativeStop::api || raise_guest_fault(result)) {
+			// A raised fault leaves the program running somewhere the handler chose; the stop it reaches next is what this loop serves.
+			if (result.stop != NativeStop::api)
+				continue;
 			const auto found = traps.find(result.value);
 			if (found == traps.end())
 				return result;
@@ -1223,6 +1371,16 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 				!memory.dispatch(api) && !kernel_string_api(process, environment, entry, *launch, api) &&
 				!shared_dispatch(api) && !desktop.dispatch(api) && !windows.dispatch(api) && !profile.dispatch(api) &&
 				!crt.dispatch(api) && !unsupported_library(process, environment, api)) {
+				// The stub the call landed on forwards to a component: the call goes on there with the caller's own frame.
+				if (const auto target = forwarded_target(result.value)) {
+					auto native = process.context();
+					native.registers.rip = *target;
+					native.registers.orig_rax = uint64_t(-1);
+					process.redirect(native, process.callback_depth());
+					budget = remaining();
+					result = process.resume(budget);
+					continue;
+				}
 				std::cerr << "raven: unimplemented native x86 API " << api << '\n';
 				if (api.starts_with("InitCommonControls") || api.starts_with("ImageList_"))
 					std::cerr << "raven: 32-bit programs take the common controls from the component built by scripts/provision-controls.py --arch x86;"
@@ -1244,7 +1402,19 @@ NativeResult run_native_process_x86(ModuleSet &modules, PEModule &entry,
 			const auto &r = context.registers;
 			std::cerr << std::hex << "fault: eip " << uint32_t(r.rip) << " eax " << uint32_t(r.rax) << " ebx " << uint32_t(r.rbx) << " ecx " << uint32_t(r.rcx)
 				<< " edx " << uint32_t(r.rdx) << " esi " << uint32_t(r.rsi) << " edi " << uint32_t(r.rdi) << " ebp " << uint32_t(r.rbp) << " esp "
-				<< uint32_t(r.rsp) << " address " << result.fault_address << "\ncode:";
+				<< uint32_t(r.rsp) << " address " << result.fault_address << " in";
+			for (const auto &[module_name, module] : modules.all()) {
+				const uint64_t base = module->loaded.base(), size = module->image.image_size;
+				if (r.rip < base || r.rip >= base + size)
+					continue;
+				std::cerr << ' ' << module_name << '+' << uint64_t(r.rip - base);
+				const auto named = std::find_if(module->exports.begin(), module->exports.end(), [&](const auto &symbol) {
+					return !symbol.names.empty() && base + symbol.address == r.rip - 1;
+				});
+				if (named != module->exports.end())
+					std::cerr << " (" << named->names.front() << " trap)";
+			}
+			std::cerr << "\ncode:";
 			try {
 				for (const auto byte : process.read_memory(r.rip - 64, 96))
 					std::cerr << ' ' << unsigned(byte);
